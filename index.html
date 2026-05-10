@@ -249,7 +249,7 @@
 
 <script>
   // ── Replace this with your Cloudflare Worker URL ──
-  var PROXY_URL = "https://docscanner-proxy.kd-kingshuk.workers.dev/";
+  var PROXY_URL = "https://YOUR_WORKER_URL_HERE";
 
   var STEPS = [
     { label: "EXTRACT VIDEO FRAMES", at: 20 },
@@ -299,7 +299,7 @@
         document.getElementById("start-btn").disabled = false;
       };
     }).catch(function() {
-      showError("Camera permission required. Tap the lock icon in Chrome's address bar, allow Camera, then reload the page.");
+      showError("Camera permission required. Tap the lock icon in Chrome's address bar, allow Camera, then reload.");
     });
   }
 
@@ -387,7 +387,6 @@
     });
   }
 
-  // ── THE FIX: handles Infinity duration from Android Chrome WebM recordings ──
   function extractFrames(blob, count) {
     return new Promise(function(resolve, reject) {
       var vid = document.createElement("video");
@@ -398,9 +397,8 @@
 
       vid.onloadedmetadata = function() {
         if (!isFinite(vid.duration)) {
-          // Android Chrome WebM bug: duration reports as Infinity.
-          // Seeking to a huge timestamp forces the browser to scan
-          // the file and resolve the real duration.
+          // Android Chrome WebM bug: duration is Infinity.
+          // Seeking to a huge number forces the browser to resolve real duration.
           vid.currentTime = 1e10;
           vid.ontimeupdate = function() {
             vid.ontimeupdate = null;
@@ -415,50 +413,37 @@
         URL.revokeObjectURL(url);
         reject(new Error("Failed to load video for frame extraction."));
       };
-
       vid.load();
     });
   }
 
   function startSeeking(vid, url, count, resolve, reject) {
     var dur = vid.duration;
-
     if (!dur || !isFinite(dur) || dur < 0.5) {
       URL.revokeObjectURL(url);
       reject(new Error("Could not read video duration. Try recording again."));
       return;
     }
-
     var frames = [];
     var times  = [];
-    for (var i = 0; i < count; i++) {
-      times.push((dur / (count + 1)) * (i + 1));
-    }
+    for (var i = 0; i < count; i++) times.push((dur / (count + 1)) * (i + 1));
     var idx = 0;
 
     vid.onseeked = function() {
       var c = document.createElement("canvas");
-      c.width  = vid.videoWidth;
-      c.height = vid.videoHeight;
+      c.width = vid.videoWidth; c.height = vid.videoHeight;
       c.getContext("2d").drawImage(vid, 0, 0);
       frames.push(c.toDataURL("image/jpeg", 0.82).split(",")[1]);
       idx++;
-      if (idx < times.length) {
-        vid.currentTime = times[idx];
-      } else {
-        URL.revokeObjectURL(url);
-        resolve(frames);
-      }
+      if (idx < times.length) { vid.currentTime = times[idx]; }
+      else { URL.revokeObjectURL(url); resolve(frames); }
     };
-
     vid.onerror = function() {
       URL.revokeObjectURL(url);
       reject(new Error("Video decode failed during frame extraction."));
     };
-
     vid.currentTime = times[0];
   }
-  // ── END FIX ──
 
   async function processVideo() {
     try {
@@ -471,12 +456,10 @@
 
       setProgress(50, "Detecting document type...");
 
-      var content = [
-        {
-          type: "text",
-          text: "You are a precision document OCR engine. These " + frames.length + " images are frames from a video recording.\n\nRULES:\n1. If the frames do NOT clearly show a text document displayed on a laptop screen, desktop monitor, or tablet — output exactly this and nothing else: ERROR:NOT_A_DOCUMENT\n2. If they DO show a document on a screen: extract ALL visible text across all frames. Reconstruct the complete document. Preserve headings, paragraphs, bullet points, and numbered lists. Represent tables as plain text using spacing. Merge content that appears in multiple frames — do not repeat it.\n3. Output ONLY the reconstructed document text. No preamble. No explanation. No markdown fences."
-        }
-      ];
+      var content = [{
+        type: "text",
+        text: "You are a precision document OCR engine. These " + frames.length + " images are frames from a video recording.\n\nRULES:\n1. If the frames do NOT clearly show a text document displayed on a laptop screen, desktop monitor, or tablet — output exactly this and nothing else: ERROR:NOT_A_DOCUMENT\n2. If they DO show a document on a screen: extract ALL visible text across all frames. Reconstruct the complete document. Preserve headings, paragraphs, bullet points, and numbered lists. Represent tables as plain text using spacing. Merge content that appears in multiple frames — do not repeat it.\n3. Output ONLY the reconstructed document text. No preamble. No explanation. No markdown fences."
+      }];
       frames.forEach(function(f) {
         content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: f } });
       });
@@ -485,7 +468,7 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
+          model: "claude-sonnet-4-6",
           max_tokens: 4000,
           messages: [{ role: "user", content: content }]
         })
