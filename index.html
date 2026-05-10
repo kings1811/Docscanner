@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#0c0c0c" />
+  <title>DocScanner</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { background: #0c0c0c; overscroll-behavior: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+    @keyframes scan { 0%{top:15%;opacity:0} 10%{opacity:0.6} 50%{top:85%;opacity:0.6} 90%{opacity:0} 100%{top:15%;opacity:0} }
+    ::-webkit-scrollbar{width:3px}
+    ::-webkit-scrollbar-track{background:#0c0c0c}
+    ::-webkit-scrollbar-thumb{background:#2a2a2a}
+    textarea{-webkit-overflow-scrolling:touch}
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    const PHASE = { IDLE: "idle", RECORDING: "recording", PROCESSING: "processing", EDITING: "editing" };
+    const STEPS = [
+      { label: "EXTRACT VIDEO FRAMES", at: 20 },
+      { label: "SAMPLE KEY FRAMES",    at: 35 },
+      { label: "DETECT DOCUMENT TYPE", at: 55 },
+      { label: "RUN OCR ENGINE",       at: 80 },
+      { label: "RECONSTRUCT DOCUMENT", at: 100 },
+    ];
+
+    function DocScannerApp() {
+      const [phase,     setPhase]     = useState(PHASE.IDLE);
+      const [recTime,   setRecTime]   = useState(0);
+      const [stepLabel, setStepLabel] = useState("");
+      const [progress,  setProgress]  = useState(0);
+      const [docText,   setDocText]   = useState("");
+      const [error,     setError]     = useState("");
+      const [camReady,  setCamReady]  = useState(false);
+
+      const videoRef   = useRef(null);
+      const recorderRef= useRef(null);
+      const chunksRef  = useRef([]);
+      const streamRef  = useRef(null);
+      const timerRef   = useRef(null);
+
+      useEffect(() => {
+        initCam();
+        return () => {
+          streamRef.current?.getTracks().forEach(t => t.stop());
+          clearInterval(timerRef.current);
+        };
+      }, []);
+
+      const initCam = async () => {
+        setCamReady(false);
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+            audio: false,
+          });
+          streamRef.current = stream;
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            setCamReady(true);
+          }
+        } catch {
+          setError("Camera permission required. Tap the lock icon in your browser's address bar and allow Camera access, then reload.");
+        }
+      };
+
+      const startRec = () => {
+        chunksRef.current = [];
+        setError("");
+        const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
+          ? "video/webm;codecs=vp9"
+          : "video/webm";
+        const recorder = new MediaRecorder(streamRef.current, { mimeType: mime });
+        recorder.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+        recorder.onstop = processVideo;
+        recorder.start(200);
+        recorderRef.current = recorder;
+        setRecTime(0);
+        setPhase(PHASE.RECORDING);
+        timerRef.current = setInterval(() => setRecTime(t => t + 1), 1000);
+      };
+
+      const stopRec = () => {
+        clearInterval(timerRef.current);
+        recorderRef.current?.stop();
+        streamRef.current?.getTracks().forEach(t => t.stop());
+        setProgress(0);
+        setPhase(PHASE.PROCESSING);
+      };
+
+      const extractFrames = (blob, count = 7) => new Promise((resolve, reject) => {
+        const vid = document.createElement("video");
+        const url = URL.createObjectURL(blob);
+        vid.src = url;
+        vid.muted = true;
+        vid.playsInline = true;
+
+        vid.onloadedmetadata = () => {
+          const dur = vid.duration;
+          if (!dur || !isFinite(dur) || dur < 0.5) {
+            URL.revokeObjectURL(url);
+            reject(new Error("Video too short or unreadable."));
+            return;
+          }
+          const frames = [];
+          const times  = Array.from({ length: count }, (_, i) => (dur / (count + 1)) * (i + 1));
+          let idx = 0;
+
+          vid.onseeked = () => {
+            const c = document.createElement("canvas");
+            c.width  = vid.videoWidth;
+            c.height = vid.videoHeight;
+            c.getContext("2d").drawImage(vid, 0, 0);
+            frames.push(c.toDataURL("image/jpeg", 0.82).split(",")[1]);
+            idx++;
+            if (idx < times.length) vid.currentTime = times[idx];
+            else { URL.revokeObjectURL(url); resolve(frames); }
+          };
+          vid.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Video decode failed.")); };
+          vid.currentTime = times[0];
+        };
+        vid.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Failed to load video.")); };
+        vid.load();
+      });
+
+      const processVideo = async () => {
+        try {
+          setStepLabel("Extracting frames from video...");
+          setProgress(10);
+          const blob = new Blob(chunksRef.current, { type: "video/webm" });
+
+          setStepLabel("Sampling key frames...");
+          setProgress(25);
+          const frames = await extractFrames(blob, 7);
+          if (!frames.length) throw new Error("No frames could be extracted.");
+
+          setStepLabel("Detecting document type...");
+          setProgress(50);
+
+          const response = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-20250514",
+              max_tokens: 4000,
+              messages: [{
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: `You are a precision document OCR engine. These ${frames.length} images are frames from a video recording.\n\nRULES:\n1. If frames do NOT clearly show a text document on a laptop/monitor/tablet screen — output exactly: ERROR:NOT_A_DOCUMENT\n2. If they DO show a document: extract ALL visible text across all frames. Reconstruct the complete document. Preserve headings, paragraphs, bullet points, numbered lists. Represent tables using plain text spacing. Merge duplicate content from multiple frames.\n3. Output ONLY the reconstructed document text. No preamble, no explanation, no markdown fences.`,
+                  },
+                  ...frames.map(f => ({
+                    type: "image",
+                    source: { type: "base64", media_type: "image/jpeg", data: f },
+                  })),
+                ],
+              }],
+            }),
+          });
+
+          setStepLabel("Running OCR engine...");
+          setProgress(80);
+
+          const data = await response.json();
+          const text = data.content?.find(b => b.type === "text")?.text?.trim() || "";
+
+          if (!text || text.includes("NOT_A_DOCUMENT")) {
+            setError("Video doesn't show a document on screen. Point your camera at a laptop or monitor displaying a document, then record.");
+            setPhase(PHASE.IDLE);
+            initCam();
+            return;
+          }
+
+          setStepLabel("Reconstructing document...");
+          setProgress(100);
+          setDocText(text);
+          setPhase(PHASE.EDITING);
+
+        } catch (err) {
+          setError("Processing failed: " + (err.message || "Unknown error."));
+          setPhase(PHASE.IDLE);
+          initCam();
+        }
+      };
+
+      const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+
+      const downloadAs = fmt => {
+        if (fmt === "txt") {
+          dl(new Blob([docText], { type: "text/plain;charset=utf-8" }), "document.txt");
+        } else if (fmt === "pdf") {
+          const w = window.open("", "_blank");
+          if (!w) { setError("Allow popups to export PDF. Tap the popup blocked icon in your address bar."); return; }
+          w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:Georgia,serif;max-width:170mm;margin:25mm auto;font-size:11pt;line-height:1.7;color:#111}pre{white-space:pre-wrap;font-family:inherit;margin:0}@media print{body{margin:0;max-width:100%}}</style></head><body><pre>${esc(docText)}</pre></body></html>`);
+          w.document.close();
+          setTimeout(() => { w.focus(); w.print(); }, 600);
+        } else if (fmt === "doc") {
+          const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8"><title>Document</title><style>body{font-family:Calibri,sans-serif;font-size:11pt;line-height:1.5}pre{white-space:pre-wrap;font-family:Calibri,sans-serif;font-size:11pt}</style></head><body><pre>${esc(docText)}</pre></body></html>`;
+          dl(new Blob(["\ufeff", html], { type: "application/msword" }), "document.doc");
+        }
+      };
+
+      const dl = (blob, name) => {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      };
+
+      const fmt = s => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+      const reset = () => { setPhase(PHASE.IDLE); setDocText(""); setError(""); setProgress(0); initCam(); };
+
+      /* ─── RENDER ─── */
+      return (
+        <div style={{ minHeight:"100vh", background:"#0c0c0c", color:"#ddd8cc", fontFamily:"'Courier New',monospace", display:"flex", flexDirection:"column", maxWidth:480, margin:"0 auto" }}>
+
+          {/* ── Header ── */}
+          <header style={{ padding:"14px 18px", borderBottom:"1px solid #1c1c1c", display:"flex", alignItems:"center", gap:10, background:"#0e0e0e" }}>
+            <div style={{ width:34, height:34, background:"#b45309", display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0 }}>◫</div>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:13, fontWeight:700, letterSpacing:"0.18em", color:"#d97706" }}>DOCSCANNER</div>
+              <div style={{ fontSize:9, color:"#3f3f3f", letterSpacing:"0.12em", marginTop:1 }}>VIDEO → DOCUMENT ENGINE</div>
+            </div>
+            {phase === PHASE.EDITING && (
+              <button onClick={reset} style={{ background:"transparent", border:"1px solid #2a2a2a", color:"#555", padding:"5px 11px", cursor:"pointer", fontSize:10, letterSpacing:"0.12em", fontFamily:"inherit" }}>
+                ＋ NEW
+              </button>
+            )}
+          </header>
+
+          {/* ── Error bar ── */}
+          {error && (
+            <div style={{ background:"#1a0000", borderBottom:"1px solid #5c1010", padding:"10px 18px", fontSize:11, color:"#f87171", letterSpacing:"0.04em", display:"flex", alignItems:"flex-start", gap:8 }}>
+              <span style={{ color:"#ef4444", flexShrink:0 }}>⚠</span>
+              <span style={{ flex:1, lineHeight:1.5 }}>{error}</span>
+              <button onClick={() => setError("")} style={{ background:"transparent", border:"none", color:"#f87171", cursor:"pointer", fontSize:16, lineHeight:1, flexShrink:0 }}>×</button>
+            </div>
+          )}
+
+          <main style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+
+            {/* ── IDLE / RECORDING ── */}
+            {(phase === PHASE.IDLE || phase === PHASE.RECORDING) && (
+              <div style={{ flex:1, display:"flex", flexDirection:"column" }}>
+                <div style={{ flex:1, background:"#000", position:"relative", minHeight:320 }}>
+                  <video ref={videoRef} autoPlay muted playsInline
+                    style={{ width:"100%", height:"100%", objectFit:"cover", display:camReady?"block":"none" }} />
+
+                  {!camReady && (
+                    <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", gap:10 }}>
+                      <div style={{ width:26, height:26, border:"2px solid #d97706", borderTopColor:"transparent", borderRadius:"50%", animation:"spin 1s linear infinite" }} />
+                      <span style={{ color:"#444", fontSize:10, letterSpacing:"0.15em" }}>ACQUIRING CAMERA</span>
+                    </div>
+                  )}
+
+                  {/* Corner brackets */}
+                  {[["top","left"],["top","right"],["bottom","left"],["bottom","right"]].map(([v,h]) => (
+                    <div key={v+h} style={{ position:"absolute", [v]:16, [h]:16, width:22, height:22, borderTop:v==="top"?"2px solid #d97706":"none", borderBottom:v==="bottom"?"2px solid #d97706":"none", borderLeft:h==="left"?"2px solid #d97706":"none", borderRight:h==="right"?"2px solid #d97706":"none", opacity:phase===PHASE.RECORDING?1:0.35, transition:"opacity 0.3s" }} />
+                  ))}
+
+                  {phase === PHASE.RECORDING && (
+                    <>
+                      <div style={{ position:"absolute", left:0, right:0, height:2, background:"linear-gradient(90deg,transparent,#d97706,transparent)", animation:"scan 2.4s ease-in-out infinite" }} />
+                      <div style={{ position:"absolute", top:14, left:"50%", transform:"translateX(-50%)", display:"flex", alignItems:"center", gap:7, background:"rgba(0,0,0,0.75)", padding:"5px 13px", border:"1px solid #7f1d1d" }}>
+                        <span style={{ width:7, height:7, borderRadius:"50%", background:"#ef4444", display:"inline-block", animation:"blink 1s step-end infinite" }} />
+                        <span style={{ fontSize:12, letterSpacing:"0.18em", color:"#f87171" }}>REC {fmt(recTime)}</span>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                <div style={{ padding:"18px 18px 28px", background:"#0e0e0e", borderTop:"1px solid #1a1a1a" }}>
+                  {phase === PHASE.IDLE && (
+                    <>
+                      <p style={{ fontSize:10, color:"#3d3d3d", textAlign:"center", letterSpacing:"0.08em", lineHeight:1.8, marginBottom:14 }}>
+                        AIM AT A DOCUMENT ON A LAPTOP / MONITOR.<br />
+                        PRESS RECORD. PAN SLOWLY ACROSS THE FULL PAGE.
+                      </p>
+                      <button onClick={startRec} disabled={!camReady} style={{ width:"100%", background:camReady?"#d97706":"#1a1a1a", color:camReady?"#000":"#333", border:"none", padding:"15px", fontSize:12, fontWeight:700, letterSpacing:"0.22em", cursor:camReady?"pointer":"not-allowed", fontFamily:"inherit", transition:"background 0.2s" }}>
+                        ● START RECORDING
+                      </button>
+                    </>
+                  )}
+                  {phase === PHASE.RECORDING && (
+                    <>
+                      <p style={{ fontSize:10, color:"#555", textAlign:"center", letterSpacing:"0.08em", lineHeight:1.8, marginBottom:14 }}>
+                        SCAN ENTIRE DOCUMENT — MOVE SLOWLY AND STEADILY
+                      </p>
+                      <button onClick={stopRec} style={{ width:"100%", background:"transparent", color:"#f87171", border:"2px solid #7f1d1d", padding:"15px", fontSize:12, fontWeight:700, letterSpacing:"0.22em", cursor:"pointer", fontFamily:"inherit" }}>
+                        ■ STOP & EXTRACT DOCUMENT
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ── PROCESSING ── */}
+            {phase === PHASE.PROCESSING && (
+              <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:36, padding:"32px 24px" }}>
+                <div>
+                  <div style={{ fontSize:10, color:"#d97706", letterSpacing:"0.25em", textAlign:"center", marginBottom:6 }}>PROCESSING DOCUMENT</div>
+                  <div style={{ fontSize:9, color:"#333", letterSpacing:"0.12em", textAlign:"center" }}>DO NOT CLOSE THIS SCREEN</div>
+                </div>
+
+                <div style={{ width:"100%", maxWidth:340 }}>
+                  <div style={{ background:"#1a1a1a", height:3 }}>
+                    <div style={{ background:"linear-gradient(90deg,#92400e,#d97706)", height:"100%", width:`${progress}%`, transition:"width 0.6s ease" }} />
+                  </div>
+                  <div style={{ display:"flex", justifyContent:"space-between", marginTop:7 }}>
+                    <span style={{ fontSize:10, color:"#444", letterSpacing:"0.06em", maxWidth:"80%" }}>{stepLabel}</span>
+                    <span style={{ fontSize:10, color:"#d97706", flexShrink:0 }}>{progress}%</span>
+                  </div>
+                </div>
+
+                <div style={{ width:"100%", maxWidth:340, display:"flex", flexDirection:"column", gap:10 }}>
+                  {STEPS.map(s => {
+                    const done = progress >= s.at;
+                    return (
+                      <div key={s.label} style={{ display:"flex", alignItems:"center", gap:12 }}>
+                        <div style={{ width:8, height:8, flexShrink:0, background:done?"#d97706":"transparent", border:`1px solid ${done?"#d97706":"#222"}`, transition:"all 0.4s" }} />
+                        <span style={{ fontSize:10, letterSpacing:"0.12em", color:done?"#d97706":"#2a2a2a", transition:"color 0.4s" }}>{s.label}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* ── EDITING ── */}
+            {phase === PHASE.EDITING && (
+              <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+                <div style={{ padding:"10px 14px", borderBottom:"1px solid #1a1a1a", display:"flex", alignItems:"center", gap:8, background:"#0e0e0e" }}>
+                  <span style={{ fontSize:9, color:"#3a3a3a", letterSpacing:"0.12em", flex:1 }}>EXTRACTED DOCUMENT — TAP TO EDIT</span>
+                  {["TXT","PDF","DOC"].map(f => (
+                    <button key={f} onClick={() => downloadAs(f.toLowerCase())} style={{ background:f==="DOC"?"#b45309":"transparent", color:f==="DOC"?"#fff8f0":"#d97706", border:`1px solid ${f==="DOC"?"#b45309":"#422006"}`, padding:"6px 12px", fontSize:10, fontWeight:700, letterSpacing:"0.14em", cursor:"pointer", fontFamily:"inherit" }}>
+                      ↓{f}
+                    </button>
+                  ))}
+                </div>
+
+                <textarea
+                  value={docText}
+                  onChange={e => setDocText(e.target.value)}
+                  spellCheck
+                  style={{ flex:1, background:"#0c0c0c", color:"#ddd8cc", border:"none", outline:"none", padding:"20px 18px", fontSize:14, lineHeight:1.75, fontFamily:"Georgia,'Times New Roman',serif", resize:"none", letterSpacing:"0.01em" }}
+                />
+
+                <div style={{ padding:"6px 18px", borderTop:"1px solid #141414", background:"#0e0e0e", display:"flex", justifyContent:"flex-end" }}>
+                  <span style={{ fontSize:9, color:"#2e2e2e", letterSpacing:"0.1em" }}>
+                    {docText.length.toLocaleString()} CHARS · {docText.split(/\s+/).filter(Boolean).length.toLocaleString()} WORDS
+                  </span>
+                </div>
+              </div>
+            )}
+          </main>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<DocScannerApp />);
+  </script>
+</body>
+</html>
