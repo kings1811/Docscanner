@@ -248,9 +248,7 @@
   </div>
 
 <script>
-  // ── IMPORTANT: After setting up your Cloudflare Worker (Part 3),
-  //    replace the URL below with your Worker URL.
-  //    It looks like: https://docscanner-proxy.YOURNAME.workers.dev
+  // ── Replace this with your Cloudflare Worker URL ──
   var PROXY_URL = "https://docscanner-proxy.kd-kingshuk.workers.dev/";
 
   var STEPS = [
@@ -389,40 +387,78 @@
     });
   }
 
+  // ── THE FIX: handles Infinity duration from Android Chrome WebM recordings ──
   function extractFrames(blob, count) {
     return new Promise(function(resolve, reject) {
       var vid = document.createElement("video");
       var url = URL.createObjectURL(blob);
-      vid.src = url; vid.muted = true; vid.playsInline = true;
+      vid.src = url;
+      vid.muted = true;
+      vid.playsInline = true;
 
       vid.onloadedmetadata = function() {
-        var dur = vid.duration;
-        if (!dur || !isFinite(dur) || dur < 0.3) {
-          URL.revokeObjectURL(url);
-          reject(new Error("Video too short — record for at least 2 seconds."));
-          return;
+        if (!isFinite(vid.duration)) {
+          // Android Chrome WebM bug: duration reports as Infinity.
+          // Seeking to a huge timestamp forces the browser to scan
+          // the file and resolve the real duration.
+          vid.currentTime = 1e10;
+          vid.ontimeupdate = function() {
+            vid.ontimeupdate = null;
+            startSeeking(vid, url, count, resolve, reject);
+          };
+        } else {
+          startSeeking(vid, url, count, resolve, reject);
         }
-        var frames = [];
-        var times  = [];
-        for (var i = 0; i < count; i++) times.push((dur / (count + 1)) * (i + 1));
-        var idx = 0;
-
-        vid.onseeked = function() {
-          var c = document.createElement("canvas");
-          c.width = vid.videoWidth; c.height = vid.videoHeight;
-          c.getContext("2d").drawImage(vid, 0, 0);
-          frames.push(c.toDataURL("image/jpeg", 0.82).split(",")[1]);
-          idx++;
-          if (idx < times.length) { vid.currentTime = times[idx]; }
-          else { URL.revokeObjectURL(url); resolve(frames); }
-        };
-        vid.onerror = function() { URL.revokeObjectURL(url); reject(new Error("Video decode failed.")); };
-        vid.currentTime = times[0];
       };
-      vid.onerror = function() { URL.revokeObjectURL(url); reject(new Error("Failed to load video.")); };
+
+      vid.onerror = function() {
+        URL.revokeObjectURL(url);
+        reject(new Error("Failed to load video for frame extraction."));
+      };
+
       vid.load();
     });
   }
+
+  function startSeeking(vid, url, count, resolve, reject) {
+    var dur = vid.duration;
+
+    if (!dur || !isFinite(dur) || dur < 0.5) {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not read video duration. Try recording again."));
+      return;
+    }
+
+    var frames = [];
+    var times  = [];
+    for (var i = 0; i < count; i++) {
+      times.push((dur / (count + 1)) * (i + 1));
+    }
+    var idx = 0;
+
+    vid.onseeked = function() {
+      var c = document.createElement("canvas");
+      c.width  = vid.videoWidth;
+      c.height = vid.videoHeight;
+      c.getContext("2d").drawImage(vid, 0, 0);
+      frames.push(c.toDataURL("image/jpeg", 0.82).split(",")[1]);
+      idx++;
+      if (idx < times.length) {
+        vid.currentTime = times[idx];
+      } else {
+        URL.revokeObjectURL(url);
+        resolve(frames);
+      }
+    };
+
+    vid.onerror = function() {
+      URL.revokeObjectURL(url);
+      reject(new Error("Video decode failed during frame extraction."));
+    };
+
+    vid.currentTime = times[0];
+  }
+  // ── END FIX ──
 
   async function processVideo() {
     try {
